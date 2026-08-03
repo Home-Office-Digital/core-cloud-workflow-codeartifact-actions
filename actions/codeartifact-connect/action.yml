@@ -1,0 +1,113 @@
+name: 'CodeArtifact Connect'
+description: 'This action assumes an IAM role via OIDC and creates the CodeArtifact connection endpoint'
+
+inputs:
+  codeartifact-domain:
+    description: 'CodeArtifact domain name.'
+    required: true
+  codeartifact-domain-owner:
+    description: 'Only required if using the Core Cloud shared repo. Account ID can be found in the Core Cloud docs. Set as a Github secret (e.g. secrets.SHARED_CODEARTIFACT_AWS_ACCOUNT_ID) and pass it in via with:. Never hardcode it.'
+    required: false
+    default: ''
+  codeartifact-repository:
+    description: 'CodeArtifact repository name.'
+    required: true
+  role-account-id:
+    description: 'AWS account ID the IAM role to assume lives in. Always your own account. Set as a Github secret (e.g. secrets.CODEARTIFACT_AWS_ACCOUNT_ID) and pass it in via with:. Never hardcode it.'
+    required: true
+  role-name:
+    description: 'Name of the IAM role to assume via OIDC for CodeArtifact access — just the role name, not the full ARN'
+    required: true
+  format:
+    description: 'CodeArtifact package format: npm | pypi | maven | nuget | ruby | swift | cargo | generic.'
+    required: true
+  aws-region:
+    description: 'AWS region of the CodeArtifact domain.'
+    required: false
+    default: 'eu-west-2'
+
+outputs:
+  codeartifact-auth-token:
+    description: 'Short-lived CodeArtifact authorization token. Also exported as $CODEARTIFACT_AUTH_TOKEN.'
+    value: ${{ steps.resolve.outputs.auth-token }}
+  codeartifact-repository-endpoint:
+    description: 'CodeArtifact repository endpoint for the requested format. Also exported as $CODEARTIFACT_REPOSITORY_ENDPOINT.'
+    value: ${{ steps.resolve.outputs.repository-endpoint }}
+
+runs:
+  using: composite
+  steps:
+    - name: Hardcoded AWS account ID check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        REF: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+        KEY_PATTERN='role[_-]to[_-]assume|domain[_-]owner|account[_-]id'
+        ACCOUNT_ID_PATTERN='[0-9]{12}'
+
+        FILES=$(gh api "repos/${REPO}/contents/.github/workflows?ref=${REF}" \
+          --jq '.[] | select(.type == "file") | select(.name | test("\\.ya?ml$")) | .path' 2>/dev/null || true)
+
+        if [ -z "$FILES" ]; then
+          echo "No .github/workflows files readable via the API (missing 'contents: read' permission, or none exist) — skipping."
+          exit 0
+        fi
+
+        FAILED=0
+        while IFS= read -r path; do
+          [ -z "$path" ] && continue
+          CONTENT=$(gh api "repos/${REPO}/contents/${path}?ref=${REF}" -H "Accept: application/vnd.github.raw")
+          MATCHES=$(printf '%s\n' "$CONTENT" | grep -nEi "$KEY_PATTERN" | grep -E "$ACCOUNT_ID_PATTERN" || true)
+          if [ -n "$MATCHES" ]; then
+            FAILED=1
+            while IFS= read -r line; do
+              LINE_NUM="${line%%:*}"
+              echo "::error file=${path},line=${LINE_NUM}::Hardcoded AWS account ID — pass it from a GitHub secret (e.g. secrets.CODEARTIFACT_AWS_ACCOUNT_ID) instead."
+            done <<< "$MATCHES"
+          fi
+        done <<< "$FILES"
+
+        if [ "$FAILED" -ne 0 ]; then
+          echo "One or more workflow files contain a hardcoded AWS account ID. See annotations above." >&2
+          exit 1
+        fi
+
+        echo "No hardcoded AWS account IDs found in .github/workflows."
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+      with:
+        role-to-assume: arn:aws:iam::${{ inputs.role-account-id }}:role/${{ inputs.role-name }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Resolve CodeArtifact connection details
+      id: resolve
+      shell: bash
+      env:
+        CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+        CODEARTIFACT_DOMAIN_OWNER: ${{ inputs.codeartifact-domain-owner || inputs.role-account-id }}
+        CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+        CODEARTIFACT_FORMAT: ${{ inputs.format }}
+      run: |
+        set -euo pipefail
+
+        echo "::add-mask::$CODEARTIFACT_DOMAIN_OWNER"
+
+        TOKEN=$(aws codeartifact get-authorization-token \
+          --domain "$CODEARTIFACT_DOMAIN" \
+          --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+          --query authorizationToken --output text)
+        echo "::add-mask::$TOKEN"
+        echo "CODEARTIFACT_AUTH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        echo "auth-token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+        ENDPOINT=$(aws codeartifact get-repository-endpoint \
+          --domain "$CODEARTIFACT_DOMAIN" \
+          --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+          --repository "$CODEARTIFACT_REPOSITORY" \
+          --format "$CODEARTIFACT_FORMAT" --query repositoryEndpoint --output text)
+        echo "CODEARTIFACT_REPOSITORY_ENDPOINT=$ENDPOINT" >> "$GITHUB_ENV"
+        echo "repository-endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
